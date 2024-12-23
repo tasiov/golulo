@@ -2,15 +2,10 @@ package cmd
 
 import (
 	"bytes"
-	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 
-	bin "github.com/gagliardetto/binary"
-	"github.com/gagliardetto/solana-go"
-	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -109,93 +104,14 @@ var depositCmd = &cobra.Command{
 		logrus.WithField("transactionCount", len(response.Data.TransactionMeta)).
 			Info("Received transactions from API")
 
-		ctx := context.Background()
-
-		blockhash, err := client.RpcClient.GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
-		if err != nil {
-			return fmt.Errorf("failed to get latest blockhash: %w", err)
+		b64_txs := []string{}
+		for _, tx := range response.Data.TransactionMeta {
+			b64_txs = append(b64_txs, tx.Transaction)
 		}
 
-		for _, meta := range response.Data.TransactionMeta {
-			logrusger := logrus.WithFields(logrus.Fields{
-				"protocol":     meta.Protocol,
-				"totalDeposit": meta.TotalDeposit,
-			})
-
-			logrusger.Info("Processing transaction")
-
-			// Decode base64 transaction
-			txBytes, err := base64.StdEncoding.DecodeString(meta.Transaction)
-			if err != nil {
-				return fmt.Errorf("failed to decode transaction for %s: %w", meta.Protocol, err)
-			}
-
-			// Deserialize the transaction
-			tx, err := solana.TransactionFromDecoder(bin.NewBinDecoder(txBytes))
-			if err != nil {
-				return fmt.Errorf("failed to deserialize transaction for %s: %w", meta.Protocol, err)
-			}
-
-			tx.Message.RecentBlockhash = blockhash.Value.Blockhash
-
-			logrusger.WithFields(logrus.Fields{
-				"requiredSignatures":       tx.Message.Header.NumRequiredSignatures,
-				"readonlySigned":           tx.Message.Header.NumReadonlySignedAccounts,
-				"readonlyUnsigned":         tx.Message.Header.NumReadonlyUnsignedAccounts,
-				"addressTableLookupsCount": len(tx.Message.AddressTableLookups),
-			}).Debug("Transaction details")
-
-			// logrus address table lookups if present
-			if len(tx.Message.AddressTableLookups) > 0 {
-				for i, lookup := range tx.Message.AddressTableLookups {
-					logrusger.WithFields(logrus.Fields{
-						"index":      i,
-						"addressKey": lookup.AccountKey.String(),
-					}).Trace("Address table lookup")
-				}
-			}
-
-			// logrus required signers
-			requiredSigners := tx.Message.AccountKeys[:tx.Message.Header.NumRequiredSignatures]
-			for i, signer := range requiredSigners {
-				logrusger.WithFields(logrus.Fields{
-					"index":     i,
-					"publicKey": signer.String(),
-				}).Debug("Required signer")
-			}
-
-			// Create a partially signed transaction
-			tx, err = client.SignTransaction(tx)
-			if err != nil {
-				return fmt.Errorf("failed to sign transaction: %w", err)
-			}
-
-			// Verify signatures
-			signaturesSet := 0
-			for i, sig := range tx.Signatures {
-				if !sig.Equals(solana.Signature{}) {
-					logrusger.WithFields(logrus.Fields{
-						"index":     i,
-						"signature": sig.String(),
-					}).Trace("Signature present")
-					signaturesSet++
-				}
-			}
-
-			logrusger.WithField("signatureCount", signaturesSet).Debug("Signature verification")
-
-			// Send the partially signed transaction
-			sig, err := client.SendTransaction(ctx, tx)
-			if err != nil {
-				logrusger.WithFields(logrus.Fields{
-					"signaturesRequired": tx.Message.Header.NumRequiredSignatures,
-					"signaturesPresent":  signaturesSet,
-					"error":              err,
-				}).Error("Failed to send transaction")
-				return fmt.Errorf("failed to send transaction for %s: %w", meta.Protocol, err)
-			}
-
-			logrusger.WithField("signature", sig.String()).Info("Transaction sent successfully")
+		err = client.HandleB64Transactions(b64_txs)
+		if err != nil {
+			return fmt.Errorf("failed to handle transactions: %w", err)
 		}
 
 		return nil

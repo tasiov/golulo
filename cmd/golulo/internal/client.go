@@ -2,12 +2,15 @@ package internal
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
 
+	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
 
@@ -83,16 +86,12 @@ func (c *SolanaClient) CreateTransaction(ctx context.Context, instructions []sol
 
 // SignTransaction signs a transaction with the client's private key
 func (c *SolanaClient) SignTransaction(tx *solana.Transaction) (*solana.Transaction, error) {
-	_, err := tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
+	tx.Sign(func(key solana.PublicKey) *solana.PrivateKey {
 		if key.Equals(c.PublicKey) {
 			return &c.PrivateKey
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to sign transaction: %w", err)
-	}
-
 	return tx, nil
 }
 
@@ -125,4 +124,61 @@ func (c *SolanaClient) CreateSignAndSendTransaction(ctx context.Context, instruc
 
 	// Send transaction
 	return c.SendTransaction(ctx, signedTx)
+}
+
+func (c *SolanaClient) HandleB64Transactions(b64_txs []string) error {
+	ctx := context.Background()
+
+	blockhash, err := c.RpcClient.GetLatestBlockhash(ctx, rpc.CommitmentFinalized)
+	if err != nil {
+		return fmt.Errorf("failed to get latest blockhash: %w", err)
+	}
+
+	for i, b64_tx := range b64_txs {
+		logger := logrus.WithField("transactionIndex", i)
+
+		// Decode base64 transaction
+		txBytes, err := base64.StdEncoding.DecodeString(b64_tx)
+		if err != nil {
+			return fmt.Errorf("failed to decode transaction: %w", err)
+		}
+
+		// Deserialize the transaction
+		tx, err := solana.TransactionFromDecoder(bin.NewBinDecoder(txBytes))
+		if err != nil {
+			return fmt.Errorf("failed to deserialize transaction: %w", err)
+		}
+
+		tx.Message.RecentBlockhash = blockhash.Value.Blockhash
+
+		logger.WithFields(logrus.Fields{
+			"requiredSignatures":       tx.Message.Header.NumRequiredSignatures,
+			"readonlySigned":           tx.Message.Header.NumReadonlySignedAccounts,
+			"readonlyUnsigned":         tx.Message.Header.NumReadonlyUnsignedAccounts,
+			"addressTableLookupsCount": len(tx.Message.AddressTableLookups),
+		}).Debug("Transaction details")
+
+		// Create a partially signed transaction
+		// Only sign with our wallet key, ignore other required signatures
+		tx, err = c.SignTransaction(tx)
+		if err != nil {
+			return fmt.Errorf("failed to sign transaction: %w", err)
+		}
+
+		// Send transaction with preflight checks disabled
+		sig, err := c.SendTransaction(ctx, tx)
+		if err != nil {
+			logger.WithFields(logrus.Fields{
+				"signaturesRequired": tx.Message.Header.NumRequiredSignatures,
+				"error":              err,
+			}).Error("Failed to send transaction")
+			return fmt.Errorf("failed to send transaction: %w", err)
+		}
+
+		logger.WithFields(logrus.Fields{
+			"signature": sig.String(),
+		}).Info("Transaction sent successfully")
+	}
+
+	return nil
 }
